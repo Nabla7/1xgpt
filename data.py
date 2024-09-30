@@ -45,8 +45,44 @@ class RawTokenDataset(TorchDataset):
                                                                    for name in ["video", "segment_ids", "actions"]]
         token_dtype = np.dtype(self.metadata.get("token_dtype", "uint32"))
         self.data = np.memmap(video_tokens_path, dtype=token_dtype, mode="r", shape=shape)
-        self.actions = np.memmap(action_tokens_path, dtype=np.uint16, mode="r", shape=(self.metadata["num_images"],))
+        #self.actions = np.memmap(action_tokens_path, dtype=np.uint16, mode="r", shape=(self.metadata["num_images"],))
 
+        action_dir = data_dir / "actions"
+        action_files = ["driving_command.bin", "joint_pos.bin", "l_hand_closure.bin", "neck_desired.bin", "r_hand_closure.bin"]
+        actions = {}
+        
+        for action_file in action_files:
+            action_name = action_file.replace('.bin', '')
+            action_path = action_dir / action_file
+            # Determine the appropriate dtype and shape for each action
+            if action_name == "joint_pos":
+                # joint_pos has shape (N, 21)
+                action_shape = (self.metadata["num_images"], 21)
+                action_dtype = np.float32
+            elif action_name == "driving_command":
+                # driving_command has shape (N, 2)
+                action_shape = (self.metadata["num_images"], 2)
+                action_dtype = np.float32
+            elif action_name in ["l_hand_closure", "r_hand_closure"]:
+                # hand closures have shape (N, 1)
+                action_shape = (self.metadata["num_images"], 1)
+                action_dtype = np.float32
+            elif action_name == "neck_desired":
+                # neck_desired has shape (N, 1)
+                action_shape = (self.metadata["num_images"], 1)
+                action_dtype = np.float32
+            else:
+                raise ValueError(f"Unknown action file: {action_file}")
+        
+            actions[action_name] = np.memmap(
+                action_path,
+                dtype=action_dtype,
+                mode="r",
+                shape=action_shape
+            )
+
+        self.actions = actions
+        
         if os.path.isfile(segment_ids_path):
             self.segment_ids = np.memmap(
                 segment_ids_path,
@@ -95,6 +131,34 @@ class RawTokenDataset(TorchDataset):
         spaced `self.stride` apart.
         """
         start_ind = self.valid_start_inds[idx]
+        end_ind = start_ind + self.video_len + 1
+        indices = range(start_ind, end_ind, self.stride)
+        
+        x = torch.from_numpy(self.data[indices].astype(np.int64))
+        x = x.flatten()
+        
+        attention_mask = torch.ones_like(x)
+        
+        # Collect action data for the sequence
+        action_sequence = {}
+        for action_name, action_data in self.actions.items():
+            action_values = action_data[indices]
+            action_sequence[action_name] = torch.from_numpy(action_values.astype(np.float32))
+        
+        return {
+            "input_ids": x,
+            "labels": x,
+            "attention_mask": attention_mask,
+            "actions": action_sequence,  # Dictionary of actions
+        }
+
+'''
+    def __getitem__(self, idx):
+        """
+        Returns a flattened sequence of tokens representing `self.window_size` frames,
+        spaced `self.stride` apart.
+        """
+        start_ind = self.valid_start_inds[idx]
         x = torch.from_numpy((self.data[start_ind : start_ind + self.video_len + 1 : self.stride]).astype(np.int64))
         x = x.flatten()
 
@@ -107,7 +171,7 @@ class RawTokenDataset(TorchDataset):
             "attention_mask": attention_mask,
             "actions": torch.from_numpy(action_sequence.astype(np.float32)),
         }
-
+'''
 
 def get_maskgit_collator(config: GenieConfig):
     mask_token_id = config.image_vocab_size
@@ -116,8 +180,8 @@ def get_maskgit_collator(config: GenieConfig):
     def collate_fn(features) -> dict[str, torch.Tensor]:
         # during training, map (z_0, z_1', z_2') -> (null, z_1, z_2)
         # (z_0, z_1') -> (null, z_1) is the diffusion operator on z_1' -> z_1
-
         input_ids = torch.stack([ex["input_ids"] for ex in features])
+        labels = torch.stack([ex["labels"] for ex in features])
         device = input_ids.device
         x_THW = rearrange(input_ids, "b (t h w) -> b t h w", b=len(features), t=config.T,
                           h=h, w=w)
@@ -164,7 +228,8 @@ def get_maskgit_collator(config: GenieConfig):
         x_THW = unfactorize_token_ids(x_THWC, config.num_factored_vocabs, config.factored_vocab_size)
         x_THW[:, first_masked_frame:][mask] = mask_token_id
 
-        actions = torch.stack([ex["actions"] for ex in features])
+        action_keys = features[0]["actions"].keys()
+        actions = {key: torch.stack([ex["actions"][key] for ex in features]) for key in action_keys}
 
         return {
             "input_ids": rearrange(x_THW, "b t h w -> b (t h w)"),

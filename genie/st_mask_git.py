@@ -12,6 +12,8 @@ from transformers.utils import ModelOutput
 from genie.factorization_utils import FactorizedEmbedding, factorize_labels
 from genie.config import GenieConfig
 from genie.st_transformer import STTransformerDecoder
+from typing import Union
+from typing import Tuple
 
 
 def cosine_schedule(u):
@@ -46,6 +48,15 @@ class STMaskGIT(nn.Module, PyTorchModelHubMixin):
             mlp_bias=config.mlp_bias,
             mlp_drop=config.mlp_drop,
         )
+        
+        # Action embeddings
+        self.action_embeddings = nn.ModuleDict({
+            "joint_pos": nn.Linear(21, config.d_model),
+            "driving_command": nn.Linear(2, config.d_model),
+            "neck_desired": nn.Linear(1, config.d_model),
+            "l_hand_closure": nn.Linear(1, config.d_model),
+            "r_hand_closure": nn.Linear(1, config.d_model),
+        })
 
         self.pos_embed_TSC = torch.nn.Parameter(torch.zeros(1, config.T, config.S, config.d_model))
         self.mask_token_id = config.image_vocab_size
@@ -74,7 +85,7 @@ class STMaskGIT(nn.Module, PyTorchModelHubMixin):
         return_logits: int = False,
         maskgit_steps: int = 1,
         temperature: float = 0.0,
-        actions: torch.Tensor = None,
+        actions: dict = None,  # Actions as a dictionary
     ) -> Union[torch.LongTensor, Tuple[torch.LongTensor, torch.FloatTensor]]:
         """
         Args designed to match the format of Llama.
@@ -98,17 +109,27 @@ class STMaskGIT(nn.Module, PyTorchModelHubMixin):
             torch.full((input_ids.size(0), num_new_frames, self.h, self.w),
                        self.mask_token_id, dtype=torch.long, device=input_ids.device)
         ], dim=1)
-
-                # Ensure actions are provided and correctly shaped
+    
+        # Prepare actions for the entire sequence
         if actions is not None:
-            # `actions` should have shape (batch_size, total_frames, action_dim)
             total_frames = inputs_masked_THW.size(1)
-            assert actions.size(1) == total_frames, f"Actions must have {total_frames} frames, but got {actions.size(1)}"
+            # Ensure each action type has the correct length
+            for action_name, action_values in actions.items():
+                assert action_values.size(1) == total_frames, f"Action '{action_name}' must have {total_frames} frames."
         else:
-            # If actions are not provided, create a placeholder (e.g., zeros)
-            action_dim = self.action_dim
-            actions = torch.zeros(inputs_masked_THW.size(0), inputs_masked_THW.size(1), action_dim, device=inputs_masked_THW.device)
-
+            # Create placeholder actions if not provided
+            action_dims = {
+                "joint_pos": 21,
+                "driving_command": 2,
+                "neck_desired": 1,
+                "l_hand_closure": 1,
+                "r_hand_closure": 1,
+            }
+            actions = {}
+            for action_name, dim in action_dims.items():
+                actions[action_name] = torch.zeros(
+                    inputs_masked_THW.size(0), inputs_masked_THW.size(1), dim, device=inputs_masked_THW.device
+                )
 
         all_factored_logits = []
         """
@@ -124,8 +145,10 @@ class STMaskGIT(nn.Module, PyTorchModelHubMixin):
             all_factored_logits.append(factored_logits)
         """
         for timestep in range(inputs_THW.size(1), inputs_THW.size(1) + num_new_frames):
-            # Extract the actions up to the current timestep
-            actions_current = actions[:, :timestep+1, :]  # Actions up to the current timestep
+            # Extract actions up to the current timestep
+            actions_current = {}
+            for action_name, action_values in actions.items():
+                actions_current[action_name] = action_values[:, :timestep+1, :]
         
             sample_HW, factored_logits = self.maskgit_generate(
                 inputs_masked_THW,
@@ -155,11 +178,11 @@ class STMaskGIT(nn.Module, PyTorchModelHubMixin):
         self,
         prompt_THW: torch.LongTensor,
         out_t: int,
-        actions: torch.Tensor = None,  # Add this parameter
+        actions: dict = None,  # Actions as a dictionary
         maskgit_steps: int = 1,
         temperature: float = 0.0,
         unmask_mode: str = "random",
-    ) -> tuple[torch.LongTensor, torch.FloatTensor]:
+    ) -> Tuple[torch.LongTensor, torch.FloatTensor]:
         """
         Performs MaskGIT-style inference to predict frame `out_t`.
 
@@ -283,27 +306,12 @@ class STMaskGIT(nn.Module, PyTorchModelHubMixin):
 
         # only optimize on the masked/noised logits?
         return relevant_loss, relevant_acc
-    """
-    def compute_logits(self, x_THW, actions=None):
-        # x_THW is for z0,...,zT while x_targets is z1,...,zT
-        x_TS = rearrange(x_THW, "B T H W -> B T (H W)")
-        x_TSC = self.token_embed(x_TS)
 
-        # additive embeddings, using the same vocab space
-        x_TSC = self.decoder(x_TSC + self.pos_embed_TSC)
-        x_next_TSC = self.out_x_proj(x_TSC)
-
-        logits_CTHW = rearrange(x_next_TSC, "B T (H W) C -> B C T H W", H=self.h, W=self.w)
-        return logits_CTHW
-    """
-
-    def compute_logits(self, x_THW, actions=None):
+    def compute_logits(self, x_THW, action_embeds=None):
         x_TS = rearrange(x_THW, "B T H W -> B T (H W)")
         x_TSC = self.token_embed(x_TS)  # (B, T, S, C)
     
-        if actions is not None:
-            # Embed actions
-            action_embeds = self.action_embedding(actions)  # (B, T, C)
+        if action_embeds is not None:
             # Expand action embeddings to match x_TSC dimensions
             action_embeds = action_embeds.unsqueeze(2).expand(-1, -1, x_TSC.size(2), -1)  # (B, T, S, C)
             # Add action embeddings to token embeddings
@@ -317,13 +325,25 @@ class STMaskGIT(nn.Module, PyTorchModelHubMixin):
         logits_CTHW = rearrange(x_next_TSC, "B T (H W) C -> B C T H W", H=self.h, W=self.w)
         return logits_CTHW
 
-
     def forward(self, input_ids, labels, actions=None):
         T, H, W = self.config.T, self.h, self.w
         x_THW = rearrange(input_ids, "B (T H W) -> B T H W", T=T, H=H, W=W)
-
-        # Modify compute_logits to accept actions
-        logits_CTHW = self.compute_logits(x_THW, actions=actions)
+    
+        # Combine action embeddings
+        if actions is not None:
+            # Assume actions is a dictionary of action tensors
+            action_embeds = []
+            for action_name, action_values in actions.items():
+                # Embed each action type
+                action_embed = self.action_embeddings[action_name](action_values)  # (B, T, C)
+                action_embeds.append(action_embed)
+            # Sum or concatenate action embeddings
+            action_embeds = torch.stack(action_embeds, dim=0).sum(dim=0)  # (B, T, C)
+        else:
+            action_embeds = None
+    
+        # Pass action embeddings to compute_logits
+        logits_CTHW = self.compute_logits(x_THW, action_embeds=action_embeds)
 
         labels = rearrange(labels, "B (T H W) -> B T H W", T=T, H=H, W=W)
 

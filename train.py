@@ -4,6 +4,7 @@ import logging
 import math
 import os
 import time
+from typing import Union
 
 import matplotlib
 import mup
@@ -243,7 +244,7 @@ def save_checkpoint(model, accelerator, args, filename):
         )
         accelerator.save_state(save_path)
 
-"""
+'''
 @torch.no_grad()
 def visualize(accelerator, model, dataloader, window_size, metrics_prefix="eval", max_steps=1):
     """
@@ -320,7 +321,7 @@ def visualize(accelerator, model, dataloader, window_size, metrics_prefix="eval"
         print(f"{metrics=}")
         wandb_tracker = accelerator.get_tracker("wandb")
         wandb_tracker.log(metrics, commit=False)
-"""
+'''
 
 @torch.no_grad()
 def visualize(accelerator, model, dataloader, window_size, metrics_prefix="eval", max_steps=1):
@@ -341,7 +342,9 @@ def visualize(accelerator, model, dataloader, window_size, metrics_prefix="eval"
         reshaped_labels = rearrange(batch["labels"][:4], "b (t s) -> b t s", t=window_size).to(accelerator.device)
 
         # Extract actions from the batch
-        actions = batch['actions'][:4].to(accelerator.device)
+        actions = {}
+        for action_name in batch['actions']:
+            actions[action_name] = batch['actions'][action_name][:4].to(accelerator.device)
 
         num_prompt_frames = window_size // 2
         num_future_frames = window_size - num_prompt_frames
@@ -349,11 +352,16 @@ def visualize(accelerator, model, dataloader, window_size, metrics_prefix="eval"
         prompt_input_ids = rearrange(reshaped_labels[:, :num_prompt_frames], "b t s -> b (t s)")
 
         # Prepare prompt actions and future actions
-        prompt_actions = actions[:, :num_prompt_frames]
-        future_actions = actions[:, num_prompt_frames:num_prompt_frames + num_future_frames]
+        prompt_actions = {}
+        future_actions = {}
+        for action_name, action_values in actions.items():
+            prompt_actions[action_name] = action_values[:, :num_prompt_frames]
+            future_actions[action_name] = action_values[:, num_prompt_frames:num_prompt_frames + num_future_frames]
 
         # Combine actions for all frames
-        all_actions = torch.cat([prompt_actions, future_actions], dim=1)
+        all_actions = {}
+        for action_name in prompt_actions:
+            all_actions[action_name] = torch.cat([prompt_actions[action_name], future_actions[action_name]], dim=1)
 
         # Generate outputs with actions
         outputs = unwrapped_model.generate(
@@ -361,7 +369,7 @@ def visualize(accelerator, model, dataloader, window_size, metrics_prefix="eval"
             attention_mask=torch.ones_like(prompt_input_ids),
             max_new_tokens=num_new_tokens,
             min_new_tokens=num_new_tokens,
-            actions=all_actions,  # Pass actions
+            actions=all_actions,  # Pass actions as dictionary
         )
 
         output_tokens = rearrange(outputs, "b (t h w) -> b t h w", t=window_size,
