@@ -45,7 +45,7 @@ class RawTokenDataset(TorchDataset):
                                                                    for name in ["video", "segment_ids", "actions"]]
         token_dtype = np.dtype(self.metadata.get("token_dtype", "uint32"))
         self.data = np.memmap(video_tokens_path, dtype=token_dtype, mode="r", shape=shape)
-        # self.actions = np.memmap(action_tokens_path, dtype=np.uint16, mode="r", shape=(self.metadata["num_images"],))
+        self.actions = np.memmap(action_tokens_path, dtype=np.uint16, mode="r", shape=(self.metadata["num_images"],))
 
         if os.path.isfile(segment_ids_path):
             self.segment_ids = np.memmap(
@@ -99,10 +99,13 @@ class RawTokenDataset(TorchDataset):
         x = x.flatten()
 
         attention_mask = torch.ones_like(x)
+
+        action_sequence = self.actions[start_ind : start_ind + self.video_len + 1 : self.stride]
         return {
             "input_ids": x,
             "labels": x,
             "attention_mask": attention_mask,
+            "actions": torch.from_numpy(action_sequence.astype(np.float32)),
         }
 
 
@@ -161,9 +164,12 @@ def get_maskgit_collator(config: GenieConfig):
         x_THW = unfactorize_token_ids(x_THWC, config.num_factored_vocabs, config.factored_vocab_size)
         x_THW[:, first_masked_frame:][mask] = mask_token_id
 
+        actions = torch.stack([ex["actions"] for ex in features])
+
         return {
             "input_ids": rearrange(x_THW, "b t h w -> b (t h w)"),
             "labels": rearrange(labels, "b t h w -> b (t h w)"),
+            "actions": actions,  # Include actions in the batch
         }
 
     return collate_fn

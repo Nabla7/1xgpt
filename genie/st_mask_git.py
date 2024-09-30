@@ -57,6 +57,9 @@ class STMaskGIT(nn.Module, PyTorchModelHubMixin):
             mask_token_id=self.mask_token_id,
         )
 
+        self.action_dim = config.action_dim  # Add action dimension to config
+        self.action_embedding = nn.Linear(self.action_dim, config.d_model)
+
         cls = FixedMuReadout if config.use_mup else nn.Linear  # (Fixed)MuReadout might slow dow down compiled training?
         self.out_x_proj = cls(config.d_model, config.factored_vocab_size * config.num_factored_vocabs)
 
@@ -71,7 +74,8 @@ class STMaskGIT(nn.Module, PyTorchModelHubMixin):
         return_logits: int = False,
         maskgit_steps: int = 1,
         temperature: float = 0.0,
-    ) -> tuple[torch.LongTensor, torch.FloatTensor]:
+        actions: torch.Tensor = None,
+    ) -> Union[torch.LongTensor, Tuple[torch.LongTensor, torch.FloatTensor]]:
         """
         Args designed to match the format of Llama.
         We ignore `attention_mask`, and use `max_new_tokens` to determine the number of frames to generate.
@@ -87,6 +91,7 @@ class STMaskGIT(nn.Module, PyTorchModelHubMixin):
         assert max_new_tokens % self.config.S == 0, "Expecting `max_new_tokens` to be a multiple of `self.config.S`."
         num_new_frames = max_new_tokens // self.config.S
 
+
         inputs_THW = rearrange(input_ids.clone(), "b (t h w) -> b t h w", h=self.h, w=self.w)
         inputs_masked_THW = torch.cat([
             inputs_THW,
@@ -94,12 +99,38 @@ class STMaskGIT(nn.Module, PyTorchModelHubMixin):
                        self.mask_token_id, dtype=torch.long, device=input_ids.device)
         ], dim=1)
 
+                # Ensure actions are provided and correctly shaped
+        if actions is not None:
+            # `actions` should have shape (batch_size, total_frames, action_dim)
+            total_frames = inputs_masked_THW.size(1)
+            assert actions.size(1) == total_frames, f"Actions must have {total_frames} frames, but got {actions.size(1)}"
+        else:
+            # If actions are not provided, create a placeholder (e.g., zeros)
+            action_dim = self.action_dim
+            actions = torch.zeros(inputs_masked_THW.size(0), inputs_masked_THW.size(1), action_dim, device=inputs_masked_THW.device)
+
+
         all_factored_logits = []
+        """
         for timestep in range(inputs_THW.size(1), inputs_THW.size(1) + num_new_frames):
             # could change sampling hparams
             sample_HW, factored_logits = self.maskgit_generate(
                 inputs_masked_THW,
                 timestep,
+                maskgit_steps=maskgit_steps,
+                temperature=temperature
+            )
+            inputs_masked_THW[:, timestep] = sample_HW
+            all_factored_logits.append(factored_logits)
+        """
+        for timestep in range(inputs_THW.size(1), inputs_THW.size(1) + num_new_frames):
+            # Extract the actions up to the current timestep
+            actions_current = actions[:, :timestep+1, :]  # Actions up to the current timestep
+        
+            sample_HW, factored_logits = self.maskgit_generate(
+                inputs_masked_THW,
+                out_t=timestep,
+                actions=actions_current,  # Pass actions up to current timestep
                 maskgit_steps=maskgit_steps,
                 temperature=temperature
             )
@@ -124,6 +155,7 @@ class STMaskGIT(nn.Module, PyTorchModelHubMixin):
         self,
         prompt_THW: torch.LongTensor,
         out_t: int,
+        actions: torch.Tensor = None,  # Add this parameter
         maskgit_steps: int = 1,
         temperature: float = 0.0,
         unmask_mode: str = "random",
@@ -160,7 +192,7 @@ class STMaskGIT(nn.Module, PyTorchModelHubMixin):
         # this will be modified in place on each iteration of this loop
         unmasked = self.init_mask(prompt_THW)
 
-        logits_CTHW = self.compute_logits(prompt_THW)
+        logits_CTHW = self.compute_logits(prompt_THW, actions=actions)
         logits_CHW = logits_CTHW[:, :, out_t]
         orig_logits_CHW = logits_CHW.clone()  # Return these original logits, not logits after partially sampling.
         for step in tqdm(range(maskgit_steps)):
@@ -251,8 +283,8 @@ class STMaskGIT(nn.Module, PyTorchModelHubMixin):
 
         # only optimize on the masked/noised logits?
         return relevant_loss, relevant_acc
-
-    def compute_logits(self, x_THW):
+    """
+    def compute_logits(self, x_THW, actions=None):
         # x_THW is for z0,...,zT while x_targets is z1,...,zT
         x_TS = rearrange(x_THW, "B T H W -> B T (H W)")
         x_TSC = self.token_embed(x_TS)
@@ -263,12 +295,35 @@ class STMaskGIT(nn.Module, PyTorchModelHubMixin):
 
         logits_CTHW = rearrange(x_next_TSC, "B T (H W) C -> B C T H W", H=self.h, W=self.w)
         return logits_CTHW
+    """
 
-    def forward(self, input_ids, labels):
+    def compute_logits(self, x_THW, actions=None):
+        x_TS = rearrange(x_THW, "B T H W -> B T (H W)")
+        x_TSC = self.token_embed(x_TS)  # (B, T, S, C)
+    
+        if actions is not None:
+            # Embed actions
+            action_embeds = self.action_embedding(actions)  # (B, T, C)
+            # Expand action embeddings to match x_TSC dimensions
+            action_embeds = action_embeds.unsqueeze(2).expand(-1, -1, x_TSC.size(2), -1)  # (B, T, S, C)
+            # Add action embeddings to token embeddings
+            x_TSC = x_TSC + action_embeds
+    
+        # Add positional embeddings and pass through the decoder
+        x_TSC = x_TSC + self.pos_embed_TSC
+        x_TSC = self.decoder(x_TSC)
+    
+        x_next_TSC = self.out_x_proj(x_TSC)
+        logits_CTHW = rearrange(x_next_TSC, "B T (H W) C -> B C T H W", H=self.h, W=self.w)
+        return logits_CTHW
+
+
+    def forward(self, input_ids, labels, actions=None):
         T, H, W = self.config.T, self.h, self.w
         x_THW = rearrange(input_ids, "B (T H W) -> B T H W", T=T, H=H, W=W)
 
-        logits_CTHW = self.compute_logits(x_THW)
+        # Modify compute_logits to accept actions
+        logits_CTHW = self.compute_logits(x_THW, actions=actions)
 
         labels = rearrange(labels, "B (T H W) -> B T H W", T=T, H=H, W=W)
 

@@ -243,7 +243,7 @@ def save_checkpoint(model, accelerator, args, filename):
         )
         accelerator.save_state(save_path)
 
-
+"""
 @torch.no_grad()
 def visualize(accelerator, model, dataloader, window_size, metrics_prefix="eval", max_steps=1):
     """
@@ -309,6 +309,99 @@ def visualize(accelerator, model, dataloader, window_size, metrics_prefix="eval"
 
             metrics["ar_lpips"].extend(compute_lpips(decoded_gtruth,  # Note: not parallelizing right now
                                                      decoded_output[:, num_prompt_frames:], lpips_alex))
+
+        if step + 1 >= max_steps:
+            break
+
+    unwrapped_model.train()
+    if accelerator.is_main_process:
+        metrics = {f"{metrics_prefix}_{key}": np.mean(val) for key, val in metrics.items() if len(val) > 0}
+
+        print(f"{metrics=}")
+        wandb_tracker = accelerator.get_tracker("wandb")
+        wandb_tracker.log(metrics, commit=False)
+"""
+
+@torch.no_grad()
+def visualize(accelerator, model, dataloader, window_size, metrics_prefix="eval", max_steps=1):
+    accelerator.wait_for_everyone()
+    unwrapped_model = accelerator.unwrap_model(model)
+
+    metadata = dataloader.dataset.metadata
+    decode_latents = decode_latents_wrapper()  # re-initializing every time to save memory
+    if accelerator.is_main_process:
+        lpips_alex = lpips.LPIPS(net="alex")  # Calculate LPIPS w/ AlexNet, the fastest option
+        metrics = {"ar_lpips": []}
+
+    latent_side_len = metadata["s"]
+
+    unwrapped_model.eval()
+    for step, batch in enumerate(dataloader):
+        # Note: hardcoding 4 image cap for faster inference on small models
+        reshaped_labels = rearrange(batch["labels"][:4], "b (t s) -> b t s", t=window_size).to(accelerator.device)
+
+        # Extract actions from the batch
+        actions = batch['actions'][:4].to(accelerator.device)
+
+        num_prompt_frames = window_size // 2
+        num_future_frames = window_size - num_prompt_frames
+        num_new_tokens = latent_side_len ** 2 * num_future_frames
+        prompt_input_ids = rearrange(reshaped_labels[:, :num_prompt_frames], "b t s -> b (t s)")
+
+        # Prepare prompt actions and future actions
+        prompt_actions = actions[:, :num_prompt_frames]
+        future_actions = actions[:, num_prompt_frames:num_prompt_frames + num_future_frames]
+
+        # Combine actions for all frames
+        all_actions = torch.cat([prompt_actions, future_actions], dim=1)
+
+        # Generate outputs with actions
+        outputs = unwrapped_model.generate(
+            input_ids=prompt_input_ids,
+            attention_mask=torch.ones_like(prompt_input_ids),
+            max_new_tokens=num_new_tokens,
+            min_new_tokens=num_new_tokens,
+            actions=all_actions,  # Pass actions
+        )
+
+        output_tokens = rearrange(outputs, "b (t h w) -> b t h w", t=window_size,
+                                  h=latent_side_len, w=latent_side_len)
+        gtruth_tokens = rearrange(reshaped_labels[:, num_prompt_frames:], "b t (h w) -> b t h w",
+                                  h=latent_side_len, w=latent_side_len)
+
+        decoded_output = decode_tokens(output_tokens.cpu(), decode_latents)
+        decoded_gtruth = decode_tokens(gtruth_tokens.cpu(), decode_latents)
+
+        decoded_output = accelerator.gather(decoded_output.to(accelerator.device)).cpu()
+        decoded_gtruth = accelerator.gather(decoded_gtruth.to(accelerator.device)).cpu()
+
+        if accelerator.is_main_process:
+            exs_per_fig = 4
+            for j in range(0, len(decoded_output), exs_per_fig):
+                fig, axs = plt.subplots(nrows=2 * exs_per_fig, ncols=window_size,
+                                        figsize=(3 * window_size, 3 * 2 * exs_per_fig))
+                for k in range(min(exs_per_fig, len(decoded_output) - j)):
+                    for i in range(num_prompt_frames):
+                        for ax in (axs[k * 2, i], axs[k * 2 + 1, i]):
+                            ax.imshow(transforms_f.to_pil_image(decoded_output[j + k, i]))
+                            ax.set_title("Context")
+                            ax.axis("off")
+
+                    for i in range(num_prompt_frames, window_size):
+                        axs[k * 2, i].imshow(transforms_f.to_pil_image(decoded_gtruth[j + k, i - num_prompt_frames]))
+                        axs[k * 2, i].set_title("Ground truth")
+                        axs[k * 2 + 1, i].imshow(transforms_f.to_pil_image(decoded_output[j + k, i]))
+                        axs[k * 2 + 1, i].set_title("Prediction")
+                        for ax in axs[:, i]:
+                            ax.axis("off")
+
+                wandb_tracker = accelerator.get_tracker("wandb")
+                wandb_tracker.log({f"vis_{metrics_prefix}_{j}": fig}, commit=False)
+                plt.close(fig)
+
+            metrics["ar_lpips"].extend(compute_lpips(
+                decoded_gtruth, decoded_output[:, num_prompt_frames:], lpips_alex
+            ))
 
         if step + 1 >= max_steps:
             break
@@ -613,7 +706,10 @@ def main():
             ctx_manager = contextlib.nullcontext() if is_update_step else accelerator.no_sync(model)
 
             with ctx_manager:
-                outputs = model(**batch)
+                outputs = model(
+                    input_ids=batch['input_ids'],
+                    labels=batch['labels'],
+                    actions=batch['actions'],)  # Pass actions to the model
                 loss = outputs.loss
                 loss_info[0] += loss.detach() * batch_size
                 loss_info[1] += batch_size
@@ -672,7 +768,10 @@ def main():
                 for step, batch in enumerate(eval_dataloader):
                     batch_size = len(batch["input_ids"])  # Last batch might not be full
                     with torch.no_grad():
-                        outputs = model(**batch)
+                        outputs = model(input_ids=batch['input_ids'],
+                                        labels=batch['labels'],
+                                        actions=batch['actions'],  # Pass actions to the model
+                                        )
 
                     loss = outputs.loss
                     eval_losses.append(accelerator.gather_for_metrics(loss.repeat(batch_size)))
