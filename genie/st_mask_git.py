@@ -132,7 +132,7 @@ class STMaskGIT(nn.Module, PyTorchModelHubMixin):
                 )
 
         all_factored_logits = []
-        """
+        """ 
         for timestep in range(inputs_THW.size(1), inputs_THW.size(1) + num_new_frames):
             # could change sampling hparams
             sample_HW, factored_logits = self.maskgit_generate(
@@ -182,10 +182,10 @@ class STMaskGIT(nn.Module, PyTorchModelHubMixin):
         maskgit_steps: int = 1,
         temperature: float = 0.0,
         unmask_mode: str = "random",
-    ) -> Tuple[torch.LongTensor, torch.FloatTensor]:
+        ) -> Tuple[torch.LongTensor, torch.FloatTensor]:
         """
         Performs MaskGIT-style inference to predict frame `out_t`.
-
+        
         Args:
             prompt_THW: Unfactorized token ids, size (B, T, H, W)
             out_t: Will return predicted unfactorized token ids for this frame.
@@ -197,42 +197,58 @@ class STMaskGIT(nn.Module, PyTorchModelHubMixin):
                 If temperature is <= 1e-8, will be greedy (i.e. argmax) instead of actual sampling.
             unmask_mode: The method to determine tokens to unmask during each step of MaskGIT inference.
                 Options:
-                    - "greedy" for unmasking the most confident tokens, which is matches the original MaskGIT
+                    - "greedy" for unmasking the most confident tokens, which matches the original MaskGIT
                     - "random" for randomly choosing tokens to unmask
                 "greedy" tends to copy the previous frame, so we default to "random" instead.
-
+        
         Returns: (sample_HW, factored_logits)
             sample_HW: size (B, H, W) corresponding to predicted unfactorized token ids for frame `out_t`.
             factored_logits: size (B, factored_vocab_size, num_factored_vocabs, H, W).
         """
-        # assume we have pre-masked z{out_t}...zT with all masks
+        # Ensure out_t is valid
         assert out_t, "maskgit_generate requires out_t > 0"
         assert torch.all(prompt_THW[:, out_t:] == self.mask_token_id), \
-            f"when generating z{out_t}, frames {out_t} and later must be masked"
-
+            f"When generating z{out_t}, frames {out_t} and later must be masked"
+        
         bs, t, h, w = prompt_THW.size(0), prompt_THW.size(1), prompt_THW.size(2), prompt_THW.size(3)
-
-        # this will be modified in place on each iteration of this loop
+        
+        # Initialize mask
         unmasked = self.init_mask(prompt_THW)
-
-        logits_CTHW = self.compute_logits(prompt_THW, actions=actions)
+        
+        # Embed actions if provided
+        if actions is not None:
+            action_embeds = []
+            for action_name, action_values in actions.items():
+                # Embed each action type
+                action_embed = self.action_embeddings[action_name](action_values)  # (B, T, C)
+                action_embeds.append(action_embed)
+            # Sum the embeddings from different action types
+            action_embeds = torch.stack(action_embeds, dim=0).sum(dim=0)  # (B, T, C)
+        else:
+            action_embeds = None
+        
+        # Compute logits with embedded actions
+        logits_CTHW = self.compute_logits(prompt_THW, action_embeds=action_embeds)
         logits_CHW = logits_CTHW[:, :, out_t]
         orig_logits_CHW = logits_CHW.clone()  # Return these original logits, not logits after partially sampling.
+        
         for step in tqdm(range(maskgit_steps)):
-            # Perform a single maskgit step (cosine schedule), updating unmasked in-place
-            if step > 0:  # recompute logits with updated prompt
-                logits_CHW = self.compute_logits(prompt_THW)[:, :, out_t]
-
-            factored_logits = rearrange(logits_CHW, "b (num_vocabs vocab_size) h w -> b vocab_size num_vocabs h w",
+            # Recompute logits if not the first step
+            if step > 0:
+                logits_CHW = self.compute_logits(prompt_THW, action_embeds=action_embeds)[:, :, out_t]
+        
+            # Rearrange logits for factorized vocabularies
+            factored_logits = rearrange(logits_CHW, "b (num_vocabs vocab_size) h w -> b vocab_size num_factored_vocabs h w",
                                         vocab_size=self.config.factored_vocab_size,
-                                        num_vocabs=self.config.num_factored_vocabs)
-
+                                        num_factored_vocabs=self.config.num_factored_vocabs)
+        
             factored_probs = torch.nn.functional.softmax(factored_logits, dim=1)
-
+        
+            # Sample tokens
             samples_HW = torch.zeros((bs, h, w), dtype=torch.long, device=prompt_THW.device)
             confidences_HW = torch.ones((bs, h, w), dtype=torch.float, device=prompt_THW.device)
             for probs in factored_probs.flip(2).unbind(2):
-                if temperature <= 1e-8:  # greedy sampling
+                if temperature <= 1e-8:  # Greedy sampling
                     sample = probs.argmax(dim=1)
                 else:
                     # Categorical expects last dim to be channel dim
@@ -243,45 +259,45 @@ class STMaskGIT(nn.Module, PyTorchModelHubMixin):
                 samples_HW *= self.config.factored_vocab_size
                 samples_HW += sample
                 confidences_HW *= torch.gather(probs, 1, sample.unsqueeze(1)).squeeze(1)
-
+        
             prev_unmasked = unmasked.clone()
             prev_img_flat = rearrange(prompt_THW[:, out_t], "B H W -> B (H W)")
-
+        
             samples_flat = samples_HW.reshape(bs, self.config.S)
-
-            if step != maskgit_steps - 1:  # skip masking for last maskgit step
-                # use cosine mask scheduling function, n is how many of frame out_t to mask
+        
+            if step != maskgit_steps - 1:  # Skip masking for last maskgit step
+                # Use cosine mask scheduling function
                 n = math.ceil(cosine_schedule((step + 1) / maskgit_steps) * self.config.S)
-
+        
                 if unmask_mode == "greedy":
-                    # set the n patches with the least confidence to mask_token
+                    # Set the n patches with the least confidence to mask_token
                     confidences_flat = confidences_HW.reshape(bs, self.config.S)
                 elif unmask_mode == "random":
-                    # randomize confidences, so that patches are randomly masked
+                    # Randomize confidences, so that patches are randomly masked
                     confidences_flat = torch.rand_like(confidences_HW).reshape(bs, self.config.S)
-                    # not probability distribution anymore, but only relative order matters
                 else:
                     raise NotImplementedError(f"Expected `unmask_mode` to be one of ['greedy', 'random'], "
                                               f"got {unmask_mode}")
-
+        
                 confidences_flat[unmasked] = torch.inf
                 least_confident_tokens = torch.argsort(confidences_flat, dim=1)
-                # unmask the (self.config.S - n) most confident tokens
+                # Unmask the (self.config.S - n) most confident tokens
                 unmasked.scatter_(1, least_confident_tokens[:, n:], True)
                 samples_flat.scatter_(1, least_confident_tokens[:, :n], self.mask_token_id)
-
-            # copy previously unmasked values from prompt input into sample
+        
+            # Copy previously unmasked values from prompt input into sample
             samples_flat[prev_unmasked] = prev_img_flat[prev_unmasked]
             samples_HW = samples_flat.reshape(-1, h, w)
-
-            # feed back to iteratively decode
+        
+            # Feed back to iteratively decode
             prompt_THW[:, out_t] = samples_HW
-
+        
         # Return the final sample and logits
         return samples_HW, rearrange(
-            orig_logits_CHW, "B (num_vocabs vocab_size) H W -> B vocab_size num_vocabs H W",
-            vocab_size=self.config.factored_vocab_size, num_vocabs=self.config.num_factored_vocabs, H=h, W=w
+            orig_logits_CHW, "B (num_vocabs vocab_size) H W -> B vocab_size num_factored_vocabs H W",
+            vocab_size=self.config.factored_vocab_size, num_factored_vocabs=self.config.num_factored_vocabs, H=h, W=w
         )
+
 
     def compute_loss_and_acc(self, logits_CTHW, targets_THW, relevant_mask_THW):
         # Video token prediction

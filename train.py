@@ -14,6 +14,7 @@ import torchvision.transforms.functional as transforms_f
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import set_seed
+from accelerate.utils import DistributedDataParallelKwargs
 from einops import rearrange
 from lpips import lpips
 from torch.utils.data import DataLoader
@@ -54,7 +55,7 @@ def parse_args():
     parser.add_argument(
         "--window_size",
         type=int,
-        default=16,
+        default=18,
         help="Number of frames to in a sequence.",
     )
     parser.add_argument(
@@ -244,19 +245,13 @@ def save_checkpoint(model, accelerator, args, filename):
         )
         accelerator.save_state(save_path)
 
-'''
 @torch.no_grad()
 def visualize(accelerator, model, dataloader, window_size, metrics_prefix="eval", max_steps=1):
-    """
-    Visualizes model's autoregressive generation outputs, logged to wandb.
-
-    metrics_prefix: each metric is logged as f"{metrics_prefix}_{metric_key}". Also used in name of wandb figure.
-    """
     accelerator.wait_for_everyone()
     unwrapped_model = accelerator.unwrap_model(model)
 
     metadata = dataloader.dataset.metadata
-    decode_latents = decode_latents_wrapper()  # re-initializing every time to save memory
+    decode_latents = decode_latents_wrapper()  # Re-initializing every time to save memory
     if accelerator.is_main_process:
         lpips_alex = lpips.LPIPS(net="alex")  # Calculate LPIPS w/ AlexNet, the fastest option
         metrics = {"ar_lpips": []}
@@ -265,115 +260,55 @@ def visualize(accelerator, model, dataloader, window_size, metrics_prefix="eval"
 
     unwrapped_model.eval()
     for step, batch in enumerate(dataloader):
-        # Note: hardcoding 4 image cap for faster inference on small models
-        reshaped_labels = rearrange(batch["labels"][:4], "b (t s) -> b t s", t=window_size).to(accelerator.device)  # `s` is really `(h, w)`
-
-        num_prompt_frames = window_size // 2  # hardcoding half of frames for context
-        num_new_tokens = latent_side_len ** 2 * (window_size - num_prompt_frames)
-        prompt_input_ids = rearrange(reshaped_labels[:, :num_prompt_frames], "b t s -> b (t s)")
-        outputs = unwrapped_model.generate(input_ids=prompt_input_ids, attention_mask=torch.ones_like(prompt_input_ids),
-                                           max_new_tokens=num_new_tokens, min_new_tokens=num_new_tokens)
-        output_tokens = rearrange(outputs, "b (t h w) -> b t h w", t=window_size,
-                                  h=latent_side_len, w=latent_side_len)
-        gtruth_tokens = rearrange(reshaped_labels[:, num_prompt_frames:], "b t (h w) -> b t h w",
-                                  h=latent_side_len, w=latent_side_len)
-
-        decoded_output = decode_tokens(output_tokens.cpu(), decode_latents)
-        decoded_gtruth = decode_tokens(gtruth_tokens.cpu(), decode_latents)
-
-        decoded_output = accelerator.gather(decoded_output.to(accelerator.device)).cpu()
-        decoded_gtruth = accelerator.gather(decoded_gtruth.to(accelerator.device)).cpu()
-
-        if accelerator.is_main_process:
-            exs_per_fig = 4
-            for j in range(0, len(decoded_output), exs_per_fig):
-                fig, axs = plt.subplots(nrows=2 * exs_per_fig, ncols=window_size, figsize=(3 * window_size, 3 * 2 * exs_per_fig))
-                # If len(decoded_output) is not a multiple of 4, make sure to truncate properly
-                for k in range(min(exs_per_fig, len(decoded_output) - j)):
-                    for i in range(num_prompt_frames):
-                        for ax in (axs[k * 2, i], axs[k * 2 + 1, i]):
-                            ax.imshow(transforms_f.to_pil_image(decoded_output[j + k, i]))
-                            ax.set_title("Context")
-                            ax.axis("off")
-
-                    for i in range(num_prompt_frames, window_size):
-                        axs[k * 2, i].imshow(transforms_f.to_pil_image(decoded_gtruth[j + k, i - num_prompt_frames]))
-                        axs[k * 2, i].set_title("Ground truth")
-                        axs[k * 2 + 1, i].imshow(transforms_f.to_pil_image(decoded_output[j + k, i]))
-                        axs[k * 2 + 1, i].set_title("Prediction")
-                        for ax in axs[:, i]:
-                            ax.axis("off")
-
-                wandb_tracker = accelerator.get_tracker("wandb")
-                wandb_tracker.log({f"vis_{metrics_prefix}_{j}": fig}, commit=False)
-                plt.close(fig)
-
-            metrics["ar_lpips"].extend(compute_lpips(decoded_gtruth,  # Note: not parallelizing right now
-                                                     decoded_output[:, num_prompt_frames:], lpips_alex))
-
-        if step + 1 >= max_steps:
-            break
-
-    unwrapped_model.train()
-    if accelerator.is_main_process:
-        metrics = {f"{metrics_prefix}_{key}": np.mean(val) for key, val in metrics.items() if len(val) > 0}
-
-        print(f"{metrics=}")
-        wandb_tracker = accelerator.get_tracker("wandb")
-        wandb_tracker.log(metrics, commit=False)
-'''
-
-@torch.no_grad()
-def visualize(accelerator, model, dataloader, window_size, metrics_prefix="eval", max_steps=1):
-    accelerator.wait_for_everyone()
-    unwrapped_model = accelerator.unwrap_model(model)
-
-    metadata = dataloader.dataset.metadata
-    decode_latents = decode_latents_wrapper()  # re-initializing every time to save memory
-    if accelerator.is_main_process:
-        lpips_alex = lpips.LPIPS(net="alex")  # Calculate LPIPS w/ AlexNet, the fastest option
-        metrics = {"ar_lpips": []}
-
-    latent_side_len = metadata["s"]
-
-    unwrapped_model.eval()
-    for step, batch in enumerate(dataloader):
-        # Note: hardcoding 4 image cap for faster inference on small models
+        # Limit to first 4 examples for faster inference on small models
         reshaped_labels = rearrange(batch["labels"][:4], "b (t s) -> b t s", t=window_size).to(accelerator.device)
 
-        # Extract actions from the batch
+        num_prompt_frames = window_size // 2  # 9
+        num_new_tokens = latent_side_len ** 2 * (window_size - num_prompt_frames)  # 81
+
+        prompt_input_ids = rearrange(reshaped_labels[:, :num_prompt_frames], "b t s -> b (t s)")
+
+        # Extract and process actions
         actions = {}
         for action_name in batch['actions']:
             actions[action_name] = batch['actions'][action_name][:4].to(accelerator.device)
 
-        num_prompt_frames = window_size // 2
-        num_future_frames = window_size - num_prompt_frames
-        num_new_tokens = latent_side_len ** 2 * num_future_frames
-        prompt_input_ids = rearrange(reshaped_labels[:, :num_prompt_frames], "b t s -> b (t s)")
-
-        # Prepare prompt actions and future actions
         prompt_actions = {}
         future_actions = {}
-        for action_name, action_values in actions.items():
-            prompt_actions[action_name] = action_values[:, :num_prompt_frames]
-            future_actions[action_name] = action_values[:, num_prompt_frames:num_prompt_frames + num_future_frames]
-
-        # Combine actions for all frames
         all_actions = {}
-        for action_name in prompt_actions:
+        for action_name, action_values in actions.items():
+            # Ensure that action_values have enough frames
+            expected_frames = num_prompt_frames + (num_new_tokens // latent_side_len ** 2)
+            assert action_values.size(1) >= expected_frames, \
+                f"Action '{action_name}' has insufficient frames: expected >= {expected_frames}, got {action_values.size(1)}"
+
+            prompt_actions[action_name] = action_values[:, :num_prompt_frames]
+            future_actions[action_name] = action_values[:, num_prompt_frames:num_prompt_frames + (num_new_tokens // latent_side_len ** 2)]
             all_actions[action_name] = torch.cat([prompt_actions[action_name], future_actions[action_name]], dim=1)
 
         # Generate outputs with actions
-        outputs = unwrapped_model.generate(
-            input_ids=prompt_input_ids,
-            attention_mask=torch.ones_like(prompt_input_ids),
-            max_new_tokens=num_new_tokens,
-            min_new_tokens=num_new_tokens,
-            actions=all_actions,  # Pass actions as dictionary
-        )
+        try:
+            outputs = unwrapped_model.generate(
+                input_ids=prompt_input_ids,
+                attention_mask=torch.ones_like(prompt_input_ids),
+                max_new_tokens=num_new_tokens,
+                min_new_tokens=num_new_tokens,
+                actions=all_actions,  # Pass actions as dictionary
+            )
+        except Exception as e:
+            logger.error(f"Error during generation: {e}")
+            raise
 
-        output_tokens = rearrange(outputs, "b (t h w) -> b t h w", t=window_size,
-                                  h=latent_side_len, w=latent_side_len)
+        if outputs is None:
+            raise ValueError("Model's generate method returned None. Ensure it returns the generated tokens.")
+
+        # Reshape the generated tokens into new frames
+        new_output_tokens = rearrange(outputs, "b (t h w) -> b t h w", t=(window_size - num_prompt_frames),
+                                      h=latent_side_len, w=latent_side_len)
+
+        # Concatenate prompt frames with generated frames
+        output_tokens = torch.cat([reshaped_labels[:, :num_prompt_frames].reshape(-1, num_prompt_frames, latent_side_len, latent_side_len), new_output_tokens], dim=1)
+
         gtruth_tokens = rearrange(reshaped_labels[:, num_prompt_frames:], "b t (h w) -> b t h w",
                                   h=latent_side_len, w=latent_side_len)
 
@@ -423,13 +358,16 @@ def visualize(accelerator, model, dataloader, window_size, metrics_prefix="eval"
         wandb_tracker.log(metrics, commit=False)
 
 
+
+
 def main():
     args = parse_args()
     assert (args.llama_config is not None) ^ (args.genie_config is not None), \
         "Exactly one of `llama_config` and `genie_config` should be set."
 
     # Manual gradient accumulation
-    accelerator = Accelerator(gradient_accumulation_steps=1, log_with=args.report_to, project_dir=args.output_dir)
+    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+    accelerator = Accelerator(gradient_accumulation_steps=1, log_with=args.report_to, project_dir=args.output_dir, kwargs_handlers=[ddp_kwargs],)
 
     # Make one log on every process with the configuration for debugging.
     logging.basicConfig(
@@ -557,6 +495,7 @@ def main():
     eval_dataloader = DataLoader(
         eval_dataset, shuffle=False, collate_fn=collate_fn,
         batch_size=args.per_device_eval_batch_size, pin_memory=True,
+        drop_last=True
     )
 
     # Scheduler and math around the number of training steps.
@@ -768,12 +707,21 @@ def main():
             if completed_steps % args.eval_every_n_steps == 0:
                 model.eval()
 
+                # Re-initialize the evaluation DataLoader
+                eval_dataloader = DataLoader(
+                    eval_dataset, shuffle=False, collate_fn=collate_fn,
+                    batch_size=args.per_device_eval_batch_size, pin_memory=True, drop_last=True
+                )
+                eval_dataloader = accelerator.prepare(eval_dataloader)
+
                 eval_losses = []
 
                 # Compute token-level accuracy (w/ teacher forcing)
                 num_correct = 0
                 num_total = 0
                 for step, batch in enumerate(eval_dataloader):
+                    if batch is None:
+                        print(batch)
                     batch_size = len(batch["input_ids"])  # Last batch might not be full
                     with torch.no_grad():
                         outputs = model(input_ids=batch['input_ids'],

@@ -173,22 +173,24 @@ class RawTokenDataset(TorchDataset):
         }
 '''
 
+# data.py
+
 def get_maskgit_collator(config: GenieConfig):
     mask_token_id = config.image_vocab_size
     h = w = math.isqrt(config.S)
 
     def collate_fn(features) -> dict[str, torch.Tensor]:
-        # during training, map (z_0, z_1', z_2') -> (null, z_1, z_2)
-        # (z_0, z_1') -> (null, z_1) is the diffusion operator on z_1' -> z_1
         input_ids = torch.stack([ex["input_ids"] for ex in features])
         labels = torch.stack([ex["labels"] for ex in features])
         device = input_ids.device
-        x_THW = rearrange(input_ids, "b (t h w) -> b t h w", b=len(features), t=config.T,
-                          h=h, w=w)
+
+        # Correctly reshape input_ids from (B, T*H*W) to (B, T, H, W)
+        x_THW = rearrange(input_ids, "b (t h w) -> b t h w", t=config.T, h=h, w=w)
+
         x_THWC = factorize_token_ids(x_THW, config.num_factored_vocabs, config.factored_vocab_size)
         labels = x_THW.clone()
 
-        # As done in Copilot-4D paper, add random noise sampled with a random rate between 0% and `config.max_corrupt_rate`
+        # Masking logic
         r = torch.rand(x_THWC.size(), device=device)
         u01 = torch.rand((), device=device)
         random_patches_mask = r < config.max_corrupt_rate * u01
@@ -212,7 +214,7 @@ def get_maskgit_collator(config: GenieConfig):
         else:  # Typical MLM masking
             first_masked_frame = 1
 
-        mask = torch.zeros(1)
+        mask = torch.zeros(1, device=device)
         c = 0
         while mask.max() == 0:  # We could get unlucky and mask no tokens?
             # per-minibatch, per-frame masking probability (could try variable masking rate from MUSE)
@@ -225,6 +227,7 @@ def get_maskgit_collator(config: GenieConfig):
         if c > 1:
             print(f"Generated mask {c} > 1 times.")
 
+        # Unfactorize the token IDs back to original
         x_THW = unfactorize_token_ids(x_THWC, config.num_factored_vocabs, config.factored_vocab_size)
         x_THW[:, first_masked_frame:][mask] = mask_token_id
 
@@ -238,3 +241,4 @@ def get_maskgit_collator(config: GenieConfig):
         }
 
     return collate_fn
+
