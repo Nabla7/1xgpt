@@ -151,28 +151,6 @@ class RawTokenDataset(TorchDataset):
             "attention_mask": attention_mask,
             "actions": action_sequence,  # Dictionary of actions
         }
-
-'''
-    def __getitem__(self, idx):
-        """
-        Returns a flattened sequence of tokens representing `self.window_size` frames,
-        spaced `self.stride` apart.
-        """
-        start_ind = self.valid_start_inds[idx]
-        x = torch.from_numpy((self.data[start_ind : start_ind + self.video_len + 1 : self.stride]).astype(np.int64))
-        x = x.flatten()
-
-        attention_mask = torch.ones_like(x)
-
-        action_sequence = self.actions[start_ind : start_ind + self.video_len + 1 : self.stride]
-        return {
-            "input_ids": x,
-            "labels": x,
-            "attention_mask": attention_mask,
-            "actions": torch.from_numpy(action_sequence.astype(np.float32)),
-        }
-'''
-
 # data.py
 
 def get_maskgit_collator(config: GenieConfig):

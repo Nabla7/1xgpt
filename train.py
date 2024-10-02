@@ -55,7 +55,7 @@ def parse_args():
     parser.add_argument(
         "--window_size",
         type=int,
-        default=18,
+        default=16,
         help="Number of frames to in a sequence.",
     )
     parser.add_argument(
@@ -492,11 +492,18 @@ def main():
         torch.randperm(len(eval_dataset), generator=torch.Generator().manual_seed(0))
     ].tolist()
 
+    # Add logging to know the length of eval_dataset
+    logger.info(f"Number of samples in eval_dataset: {len(eval_dataset)}")
+    
     eval_dataloader = DataLoader(
         eval_dataset, shuffle=False, collate_fn=collate_fn,
         batch_size=args.per_device_eval_batch_size, pin_memory=True,
-        drop_last=True
+        drop_last=False
     )
+
+    # Log the number of batches in eval_dataloader
+    num_eval_batches = len(eval_dataloader)
+    logger.info(f"Number of batches in eval_dataloader: {num_eval_batches}")
 
     # Scheduler and math around the number of training steps.
     overrode_max_train_steps = False
@@ -541,6 +548,16 @@ def main():
     model, optimizer, train_dataloader, eval_dataloader, lr_scheduler = accelerator.prepare(
         model, optimizer, train_dataloader, eval_dataloader, lr_scheduler
     )
+
+    # Log info about eval_dataloader after preparation
+    logger.info("After accelerator.prepare:")
+    logger.info(f"Type of eval_dataloader: {type(eval_dataloader)}")
+
+    try:
+        num_eval_batches = len(eval_dataloader)
+        logger.info(f"Number of batches in eval_dataloader after prepare: {num_eval_batches}")
+    except TypeError as e:
+        logger.warning(f"Could not get length of eval_dataloader after prepare: {e}")
 
     if not args.no_compile:
         torch._dynamo.config.cache_size_limit = 128
@@ -706,14 +723,6 @@ def main():
 
             if completed_steps % args.eval_every_n_steps == 0:
                 model.eval()
-
-                # Re-initialize the evaluation DataLoader
-                eval_dataloader = DataLoader(
-                    eval_dataset, shuffle=False, collate_fn=collate_fn,
-                    batch_size=args.per_device_eval_batch_size, pin_memory=True, drop_last=True
-                )
-                eval_dataloader = accelerator.prepare(eval_dataloader)
-
                 eval_losses = []
 
                 # Compute token-level accuracy (w/ teacher forcing)
