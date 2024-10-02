@@ -151,7 +151,6 @@ class RawTokenDataset(TorchDataset):
             "attention_mask": attention_mask,
             "actions": action_sequence,  # Dictionary of actions
         }
-# data.py
 
 def get_maskgit_collator(config: GenieConfig):
     mask_token_id = config.image_vocab_size

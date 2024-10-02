@@ -263,8 +263,9 @@ def visualize(accelerator, model, dataloader, window_size, metrics_prefix="eval"
         # Limit to first 4 examples for faster inference on small models
         reshaped_labels = rearrange(batch["labels"][:4], "b (t s) -> b t s", t=window_size).to(accelerator.device)
 
-        num_prompt_frames = window_size // 2  # 9
-        num_new_tokens = latent_side_len ** 2 * (window_size - num_prompt_frames)  # 81
+        num_prompt_frames = window_size // 2  # e.g., 8
+        num_new_frames = window_size - num_prompt_frames  # e.g., 8
+        num_new_tokens = latent_side_len ** 2 * num_new_frames
 
         prompt_input_ids = rearrange(reshaped_labels[:, :num_prompt_frames], "b t s -> b (t s)")
 
@@ -273,18 +274,21 @@ def visualize(accelerator, model, dataloader, window_size, metrics_prefix="eval"
         for action_name in batch['actions']:
             actions[action_name] = batch['actions'][action_name][:4].to(accelerator.device)
 
-        prompt_actions = {}
-        future_actions = {}
         all_actions = {}
+        total_frames = window_size  # Total frames including prompt and generated frames
         for action_name, action_values in actions.items():
-            # Ensure that action_values have enough frames
-            expected_frames = num_prompt_frames + (num_new_tokens // latent_side_len ** 2)
-            assert action_values.size(1) >= expected_frames, \
-                f"Action '{action_name}' has insufficient frames: expected >= {expected_frames}, got {action_values.size(1)}"
+            # Only use actions up to the prompt frames
+            action_prompt = action_values[:, :num_prompt_frames]
+            # Pad the rest with zeros for future frames
+            pad_size = total_frames - num_prompt_frames  # Number of frames to be generated
+            pad_shape = (action_prompt.size(0), pad_size, action_prompt.size(2))
+            pad_actions = torch.zeros(pad_shape, device=action_prompt.device)
+            # Concatenate prompt actions with padding
+            all_actions[action_name] = torch.cat([action_prompt, pad_actions], dim=1)
+            # Verify that the action tensor now matches the total frames
+            assert all_actions[action_name].size(1) == total_frames, \
+                f"Action '{action_name}' has incorrect temporal dimension after padding."
 
-            prompt_actions[action_name] = action_values[:, :num_prompt_frames]
-            future_actions[action_name] = action_values[:, num_prompt_frames:num_prompt_frames + (num_new_tokens // latent_side_len ** 2)]
-            all_actions[action_name] = torch.cat([prompt_actions[action_name], future_actions[action_name]], dim=1)
 
         # Generate outputs with actions
         try:
@@ -303,8 +307,8 @@ def visualize(accelerator, model, dataloader, window_size, metrics_prefix="eval"
             raise ValueError("Model's generate method returned None. Ensure it returns the generated tokens.")
 
         # Reshape the generated tokens into new frames
-        new_output_tokens = rearrange(outputs, "b (t h w) -> b t h w", t=(window_size - num_prompt_frames),
-                                      h=latent_side_len, w=latent_side_len)
+        new_output_tokens = rearrange(outputs, "b (t h w) -> b t h w", t=window_size,
+                              h=latent_side_len, w=latent_side_len)
 
         # Concatenate prompt frames with generated frames
         output_tokens = torch.cat([reshaped_labels[:, :num_prompt_frames].reshape(-1, num_prompt_frames, latent_side_len, latent_side_len), new_output_tokens], dim=1)

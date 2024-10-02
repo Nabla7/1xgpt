@@ -86,7 +86,7 @@ class STMaskGIT(nn.Module, PyTorchModelHubMixin):
         maskgit_steps: int = 1,
         temperature: float = 0.0,
         actions: dict = None,  # Actions as a dictionary
-    ) -> Union[torch.LongTensor, Tuple[torch.LongTensor, torch.FloatTensor]]:
+    ) -> Tuple[torch.LongTensor, torch.FloatTensor]:
         """
         Args designed to match the format of Llama.
         We ignore `attention_mask`, and use `max_new_tokens` to determine the number of frames to generate.
@@ -113,9 +113,17 @@ class STMaskGIT(nn.Module, PyTorchModelHubMixin):
         # Prepare actions for the entire sequence
         if actions is not None:
             total_frames = inputs_masked_THW.size(1)
-            # Ensure each action type has the correct length
+            # Handle cases where actions are shorter than total_frames
             for action_name, action_values in actions.items():
-                assert action_values.size(1) == total_frames, f"Action '{action_name}' must have {total_frames} frames."
+                if action_values.size(1) < total_frames:
+                    # Pad action_values to match total_frames
+                    pad_size = total_frames - action_values.size(1)
+                    pad_shape = (action_values.size(0), pad_size, action_values.size(2))
+                    pad_actions = torch.zeros(pad_shape, device=action_values.device)
+                    actions[action_name] = torch.cat([action_values, pad_actions], dim=1)
+                elif action_values.size(1) > total_frames:
+                    # Trim action_values to match total_frames
+                    actions[action_name] = action_values[:, :total_frames, :]
         else:
             # Create placeholder actions if not provided
             action_dims = {
@@ -159,7 +167,6 @@ class STMaskGIT(nn.Module, PyTorchModelHubMixin):
             )
             inputs_masked_THW[:, timestep] = sample_HW
             all_factored_logits.append(factored_logits)
-
         predicted_tokens = rearrange(inputs_masked_THW, "B T H W -> B (T H W)")
         if return_logits:
             return predicted_tokens, torch.stack(all_factored_logits, dim=3)  # (b, factored_vocab_size, num_factored_vocabs, num_new_frames, h, w)
@@ -238,9 +245,9 @@ class STMaskGIT(nn.Module, PyTorchModelHubMixin):
                 logits_CHW = self.compute_logits(prompt_THW, action_embeds=action_embeds)[:, :, out_t]
         
             # Rearrange logits for factorized vocabularies
-            factored_logits = rearrange(logits_CHW, "b (num_vocabs vocab_size) h w -> b vocab_size num_factored_vocabs h w",
+            factored_logits = rearrange(logits_CHW, "b (num_vocabs vocab_size) h w -> b vocab_size num_vocabs h w",
                                         vocab_size=self.config.factored_vocab_size,
-                                        num_factored_vocabs=self.config.num_factored_vocabs)
+                                        num_vocabs=self.config.num_factored_vocabs)
         
             factored_probs = torch.nn.functional.softmax(factored_logits, dim=1)
         
@@ -294,8 +301,8 @@ class STMaskGIT(nn.Module, PyTorchModelHubMixin):
         
         # Return the final sample and logits
         return samples_HW, rearrange(
-            orig_logits_CHW, "B (num_vocabs vocab_size) H W -> B vocab_size num_factored_vocabs H W",
-            vocab_size=self.config.factored_vocab_size, num_factored_vocabs=self.config.num_factored_vocabs, H=h, W=w
+            orig_logits_CHW, "B (num_vocabs vocab_size) H W -> B vocab_size num_vocabs H W",
+            vocab_size=self.config.factored_vocab_size, num_vocabs=self.config.num_factored_vocabs, H=h, W=w
         )
 
 
@@ -328,6 +335,17 @@ class STMaskGIT(nn.Module, PyTorchModelHubMixin):
         x_TSC = self.token_embed(x_TS)  # (B, T, S, C)
     
         if action_embeds is not None:
+            # Handle possible mismatch in temporal dimensions
+            if action_embeds.size(1) < x_TSC.size(1):
+                # Pad action_embeds to match the temporal dimension
+                pad_size = x_TSC.size(1) - action_embeds.size(1)
+                pad_shape = (action_embeds.size(0), pad_size, action_embeds.size(2))
+                pad_embeds = torch.zeros(pad_shape, device=action_embeds.device)
+                action_embeds = torch.cat([action_embeds, pad_embeds], dim=1)
+            elif action_embeds.size(1) > x_TSC.size(1):
+                # Trim action_embeds to match the temporal dimension
+                action_embeds = action_embeds[:, :x_TSC.size(1), :]
+    
             # Expand action embeddings to match x_TSC dimensions
             action_embeds = action_embeds.unsqueeze(2).expand(-1, -1, x_TSC.size(2), -1)  # (B, T, S, C)
             # Add action embeddings to token embeddings
